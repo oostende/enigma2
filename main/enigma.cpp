@@ -1,6 +1,4 @@
 #include <unistd.h>
-#include <iostream>
-#include <fstream>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/types.h>
@@ -16,7 +14,6 @@
 #include <lib/base/eerror.h>
 #include <lib/base/init.h>
 #include <lib/base/init_num.h>
-#include <lib/base/nconfig.h>
 #include <lib/gdi/gmaindc.h>
 #include <lib/gdi/glcddc.h>
 #include <lib/gdi/grc.h>
@@ -33,13 +30,13 @@
 #include <lib/python/python.h>
 #include <lib/python/pythonconfig.h>
 
+#include <fstream>
+#include <sstream>
+
 #include "bsod.h"
 #include "version_info.h"
 
 #include <gst/gst.h>
-
-#include <lib/base/eerroroutput.h>
-ePtr<eErrorOutput> m_erroroutput;
 
 #ifdef OBJECT_DEBUG
 int object_total_remaining;
@@ -65,34 +62,11 @@ void keyEvent(const eRCKey &key)
 {
 	static eRCKey last(0, 0, 0);
 	static int num_repeat;
-	static int long_press_emulation_pushed = false;
-	static time_t long_press_emulation_start = 0;
 
 	ePtr<eActionMap> ptr;
 	eActionMap::getInstance(ptr);
-	/*eDebug("key.code : %02x \n", key.code);*/
 
-	int flags = key.flags;
-	int long_press_emulation_key = eConfigManager::getConfigIntValue("config.usage.long_press_emulation_key");
-	if ((long_press_emulation_key > 0) && (key.code == long_press_emulation_key))
-	{
-		long_press_emulation_pushed = true;
-		long_press_emulation_start = time(NULL);
-		last = key;
-		return;
-	}
-
-	if (long_press_emulation_pushed && (time(NULL) - long_press_emulation_start < 10) && (key.producer == last.producer))
-	{
-		// emit make-event first
-		ptr->keyPressed(key.producer->getIdentifier(), key.code, key.flags);
-		// then setup condition for long-event
-		num_repeat = 3;
-		last = key;
-		flags = eRCKey::flagRepeat;
-	}
-
-	if ((key.code == last.code) && (key.producer == last.producer) && flags & eRCKey::flagRepeat)
+	if ((key.code == last.code) && (key.producer == last.producer) && key.flags & eRCKey::flagRepeat)
 		num_repeat++;
 	else
 	{
@@ -112,9 +86,7 @@ void keyEvent(const eRCKey &key)
 		ptr->keyPressed(key.producer->getIdentifier(), 510 /* faked KEY_ASCII */, 0);
 	}
 	else
-		ptr->keyPressed(key.producer->getIdentifier(), key.code, flags);
-
-	long_press_emulation_pushed = false;
+		ptr->keyPressed(key.producer->getIdentifier(), key.code, key.flags);
 }
 
 /************************************************/
@@ -126,7 +98,10 @@ void keyEvent(const eRCKey &key)
 #include <lib/dvb/dvbtime.h>
 #include <lib/dvb/epgcache.h>
 
-class eMain: public eApplication, public Object
+/* Defined in eerror.cpp */
+void setDebugTime(bool enable);
+
+class eMain: public eApplication, public sigc::trackable
 {
 	eInit init;
 	ePythonConfigQuery config;
@@ -155,48 +130,6 @@ public:
 	}
 };
 
-bool replace(std::string& str, const std::string& from, const std::string& to) 
-{
-	size_t start_pos = str.find(from);
-	if(start_pos == std::string::npos)
-		return false;
-	str.replace(start_pos, from.length(), to);
-	return true;
-}
-
-static const std::string getConfigCurrentSpinner(const std::string &key)
-{
-	std::string value = "spinner";
-	std::ifstream in(eEnv::resolve("${sysconfdir}/enigma2/settings").c_str());
-	
-	if (in.good()) {
-		do {
-			std::string line;
-			std::getline(in, line);
-			size_t size = key.size();
-			if (line.compare(0, size, key)== 0) {
-				value = line.substr(size + 1);
-				replace(value, "skin.xml", "spinner");
-				break;
-			}
-		} while (in.good());
-		in.close();
-	}
-	// if value is empty, means no config.skin.primary_skin exist in settings file, so return just default spinner ( /usr/share/enigma2/spinner )
-	if (value.empty()) 
-		return value;
-	
-	 //  if value is NOT empty, means config.skin.primary_skin exist in settings file, so return SCOPE_CURRENT_SKIN + "/spinner" ( /usr/share/enigma2/MYSKIN/spinner ) BUT check if /usr/share/enigma2/MYSKIN/spinner/wait1.png exist
-	std::string png_location = "/usr/share/enigma2/" + value + "/wait1.png";
-	std::ifstream png(png_location.c_str());
-	if (png.good()) {
-		png.close();
-		return value; // if value is NOT empty, means config.skin.primary_skin exist in settings file, so return SCOPE_CURRENT_SKIN + "/spinner" ( /usr/share/enigma2/MYSKIN/spinner/wait1.png exist )
-	}
-	else
-		return "spinner";  // if value is NOT empty, means config.skin.primary_skin exist in settings file, so return "spinner" ( /usr/share/enigma2/MYSKIN/spinner/wait1.png DOES NOT exist )
-} 
-
 int exit_code;
 
 void quitMainloop(int exitCode)
@@ -213,11 +146,11 @@ void quitMainloop(int exitCode)
 		if (fd >= 0)
 		{
 			if (ioctl(fd, 10 /*FP_CLEAR_WAKEUP_TIMER*/) < 0)
-				eDebug("FP_CLEAR_WAKEUP_TIMER failed (%m)");
+				eDebug("[quitMainloop] FP_CLEAR_WAKEUP_TIMER failed: %m");
 			close(fd);
 		}
 		else
-			eDebug("open /dev/dbox/fp0 for wakeup timer clear failed!(%m)");
+			eDebug("[quitMainloop] open /dev/dbox/fp0 for wakeup timer clear failed: %m");
 	}
 	exit_code = exitCode;
 	eApp->quit(0);
@@ -253,28 +186,23 @@ int main(int argc, char **argv)
 
 	gst_init(&argc, &argv);
 
-	for (int i = 0; i < argc; i++)
-	{
-		if (!(strcmp(argv[i], "--debug-no-color")) or !(strcmp(argv[i], "--nc")))
-		{
-			logOutputColors = 0;
-		}
-	}
-
-	m_erroroutput = new eErrorOutput();
-	m_erroroutput->run();
-
 	// set pythonpath if unset
 	setenv("PYTHONPATH", eEnv::resolve("${libdir}/enigma2/python").c_str(), 0);
 	printf("PYTHONPATH: %s\n", getenv("PYTHONPATH"));
 	printf("DVB_API_VERSION %d DVB_API_VERSION_MINOR %d\n", DVB_API_VERSION, DVB_API_VERSION_MINOR);
 
-	bsodLogInit();
+	// get enigma2 debug level settings
+	debugLvl = getenv("ENIGMA_DEBUG_LVL") ? atoi(getenv("ENIGMA_DEBUG_LVL")) : 4;
+
+	if (debugLvl < 0)
+		debugLvl = 0;
+	printf("ENIGMA_DEBUG_LVL=%d\n", debugLvl);
+	if (getenv("ENIGMA_DEBUG_TIME"))
+		setDebugTime(atoi(getenv("ENIGMA_DEBUG_TIME")) != 0);
 
 	ePython python;
 	eMain main;
 
-#if 1
 	ePtr<gMainDC> my_dc;
 	gMainDC::getInstance(my_dc);
 
@@ -284,8 +212,8 @@ int main(int argc, char **argv)
 	gLCDDC::getInstance(my_lcd_dc);
 
 
-	/* ok, this is currently hardcoded for arabic. */
-	/* some characters are wrong in the regular font, force them to use the replacement font */
+		/* ok, this is currently hardcoded for arabic. */
+			/* some characters are wrong in the regular font, force them to use the replacement font */
 	for (int i = 0x60c; i <= 0x66d; ++i)
 		eTextPara::forceReplacementGlyph(i);
 	eTextPara::forceReplacementGlyph(0xfdf2);
@@ -296,11 +224,11 @@ int main(int argc, char **argv)
 	eWidgetDesktop dsk_lcd(my_lcd_dc->size());
 
 	dsk.setStyleID(0);
-	dsk_lcd.setStyleID(my_lcd_dc->size().width() == 96 ? 2 : 1);
+	dsk_lcd.setStyleID(1);
 
 /*	if (double_buffer)
 	{
-		eDebug(" - double buffering found, enable buffered graphics mode.");
+		eDebug("[MAIN] - double buffering found, enable buffered graphics mode.");
 		dsk.setCompositionMode(eWidgetDesktop::cmBuffered);
 	} */
 
@@ -311,15 +239,13 @@ int main(int argc, char **argv)
 	dsk_lcd.setDC(my_lcd_dc);
 
 	dsk.setBackgroundColor(gRGB(0,0,0,0xFF));
-#endif
 
 		/* redrawing is done in an idle-timer, so we have to set the context */
 	dsk.setRedrawTask(main);
 	dsk_lcd.setRedrawTask(main);
 
-	std::string active_skin = getConfigCurrentSpinner("config.skin.primary_skin");
 
-	eDebug("Loading spinners...");
+	eDebug("[MAIN] Loading spinners...");
 
 	{
 		int i;
@@ -329,16 +255,16 @@ int main(int argc, char **argv)
 		{
 			char filename[64];
 			std::string rfilename;
-			snprintf(filename, sizeof(filename), "${datadir}/enigma2/%s/wait%d.png", active_skin.c_str(), i + 1);
+			snprintf(filename, sizeof(filename), "${datadir}/enigma2/skin_default/spinner/wait%d.png", i + 1);
 			rfilename = eEnv::resolve(filename);
 			loadPNG(wait[i], rfilename.c_str());
 
 			if (!wait[i])
 			{
 				if (!i)
-					eDebug("failed to load %s! (%m)", rfilename.c_str());
+					eDebug("[MAIN] failed to load %s: %m", rfilename.c_str());
 				else
-					eDebug("found %d spinner!", i);
+					eDebug("[MAIN] found %d spinner!\n", i);
 				break;
 			}
 		}
@@ -350,9 +276,9 @@ int main(int argc, char **argv)
 
 	gRC::getInstance()->setSpinnerDC(my_dc);
 
-	eRCInput::getInstance()->keyEvent.connect(slot(keyEvent));
+	eRCInput::getInstance()->keyEvent.connect(sigc::ptr_fun(&keyEvent));
 
-	printf("executing main\n");
+	printf("[MAIN] executing main\n");
 
 	bsodCatchSignals();
 	catchTermSignal();
@@ -362,7 +288,7 @@ int main(int argc, char **argv)
 	/* start at full size */
 	eVideoWidget::setFullsize(true);
 
-	//	python.execute("mytest", "__main__");
+//	python.execute("mytest", "__main__");
 	python.execFile(eEnv::resolve("${libdir}/enigma2/python/mytest.py").c_str());
 
 	/* restore both decoders to full size */
@@ -370,7 +296,7 @@ int main(int argc, char **argv)
 
 	if (exit_code == 5) /* python crash */
 	{
-		eDebug("(exit code 5)");
+		eDebug("[MAIN] (exit code 5)");
 		bsodFatal(0);
 	}
 
@@ -383,7 +309,7 @@ int main(int argc, char **argv)
 		p.clear();
 		p.flush();
 	}
-	m_erroroutput = NULL;
+
 	return exit_code;
 }
 
@@ -405,7 +331,12 @@ void runMainloop()
 
 const char *getEnigmaVersionString()
 {
-	return enigma2_date;
+	return enigma2_version;
+}
+
+const char *getBoxType()
+{
+	return BOXTYPE;
 }
 
 const char *getGStreamerVersionString()
@@ -420,22 +351,3 @@ void dump_malloc_stats(void)
 	struct mallinfo mi = mallinfo();
 	eDebug("MALLOC: %d total", mi.uordblks);
 }
-
-#ifdef USE_LIBVUGLES2
-#include <vuplus_gles.h>
-
-void setAnimation_current(int a)
-{
-	gles_set_animation_func(a);
-}
-
-void setAnimation_speed(int speed)
-{
-	gles_set_animation_speed(speed);
-}
-#else
-#ifndef HAVE_OSDANIMATION
-void setAnimation_current(int a) {}
-void setAnimation_speed(int speed) {}
-#endif
-#endif
